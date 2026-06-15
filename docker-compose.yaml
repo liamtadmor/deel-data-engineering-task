@@ -10,6 +10,7 @@ services:
         - pg-data:/var/lib/postgresql/data
         - "${PWD}/db-scripts/initialize_db_ddl.sql:/docker-entrypoint-initdb.d/initialize_db_ddl.sql"
         - "${PWD}/db-scripts/initialize_analytics_ddl.sql:/docker-entrypoint-initdb.d/initialize_analytics_ddl.sql"  # new ddl for analytics schema
+        - "${PWD}/db-scripts/populate_analytics_dim_dates_table.sql:/docker-entrypoint-initdb.d/populate_analytics_dim_dates_table.sql"  # query to populate the dim_date table of the new schema
     ports:
       - "5432:5432"
     command: ["postgres", "-c", "wal_level=logical", "-c", "hot_standby=on"]
