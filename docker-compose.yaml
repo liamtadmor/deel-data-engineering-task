@@ -66,5 +66,18 @@ services:
     entrypoint: ["/bin/sh", "/init-connectors.sh"]
     restart: "no"
 
+    # NEW streaming pipeline service
+  streaming-pipeline:
+    build:
+      context: ./pipeline
+    container_name: acme_streaming_pipeline
+    restart: always
+    environment:
+      KAFKA_BROKER: kafka:9092
+      ANALYTICAL_DB_URL: "postgresql://finance_db_user:1234@transactions-db:5432/finance_db"
+    depends_on:
+      - kafka
+      - transactions-db
+
 volumes:
   pg-data:
