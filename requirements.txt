@@ -1,0 +1,5 @@
+kafka-python-ng==2.2.2
+psycopg2-binary==2.9.12
+confluent-kafka==2.14.2
+fastapi==0.137.1
+uvicorn==0.28.0

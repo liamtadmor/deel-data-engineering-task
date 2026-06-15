@@ -32,6 +32,24 @@ CREATE TABLE IF NOT EXISTS analytics.dim_products (
     is_current BOOLEAN DEFAULT TRUE
     );
 
+-- Staging tables to handle out-of-order CDC events between orders and order_items topics
+CREATE TABLE IF NOT EXISTS analytics.staging_orders (
+    order_id      BIGINT PRIMARY KEY,
+    customer_id   BIGINT NOT NULL,
+    order_date    INT NOT NULL,
+    delivery_date INT,
+    status        VARCHAR(50) NOT NULL,
+    updated_at    TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analytics.staging_order_items (
+    order_item_id BIGINT PRIMARY KEY,
+    order_id      BIGINT NOT NULL,
+    product_id    BIGINT NOT NULL,
+    quantity      INT NOT NULL,
+    updated_at    TIMESTAMP NOT NULL
+);
+
 -- Build the Fact Table (one line item per order)
 CREATE TABLE IF NOT EXISTS analytics.customer_order_items (
     customer_order_item BIGSERIAL PRIMARY KEY,

@@ -69,15 +69,28 @@ services:
     # NEW streaming pipeline service
   streaming-pipeline:
     build:
-      context: ./pipeline
+      context: .
+      dockerfile: ./pipeline/Dockerfile
     container_name: acme_streaming_pipeline
     restart: always
     environment:
-      KAFKA_BROKER: kafka:9092
+      KAFKA_BROKER: kafka:29092
       ANALYTICAL_DB_URL: "postgresql://finance_db_user:1234@transactions-db:5432/finance_db"
     depends_on:
       - kafka
       - transactions-db
+
+  analytics-api:
+    build:
+      context: .
+      dockerfile: ./api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ANALYTICAL_DB_URL=postgresql://finance_db_user:1234@transactions-db:5432/finance_db
+    depends_on:
+      - transactions-db
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 volumes:
   pg-data:

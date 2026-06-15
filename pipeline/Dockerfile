@@ -8,10 +8,9 @@ WORKDIR /app
 
 # Install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy logic layer
-COPY stream_worker.py .
+COPY pipeline/stream_worker.py .
 
 CMD ["python", "stream_worker.py"]

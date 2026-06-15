@@ -1,194 +1,287 @@
 import json
 import os
-import sys
 import time
 import psycopg2
-# 🚀 Switch to the high-performance Confluent Kafka engine
+from datetime import date, timedelta
 from confluent_kafka import Consumer, KafkaError
 
-# Configuration from environment variables
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 DB_URL = os.getenv("ANALYTICAL_DB_URL", "postgresql://finance_db_user:1234@transactions-db:5432/finance_db")
 
-DIM_DATE_TIMESTAMP_FORMAT = '%Y%m%d'
+TOPICS = [
+    'finance_db.operations.customers',
+    'finance_db.operations.products',
+    'finance_db.operations.orders',
+    'finance_db.operations.order_items',
+]
+
+
+def epoch_days_to_yyyymmdd(epoch_days):
+    return int((date(1970, 1, 1) + timedelta(days=epoch_days)).strftime('%Y%m%d'))
+
 
 def get_db_connection():
-    """Retries database connection if it is not immediately ready on startup."""
     while True:
         try:
             conn = psycopg2.connect(DB_URL)
+            conn.autocommit = False
             return conn
         except psycopg2.OperationalError:
-            print("Analytics Database not ready yet, retrying in 3 seconds...")
+            print("DB not ready, retrying in 3s...")
             time.sleep(3)
 
-def init_kafka_consumer():
-    """Initializes Confluent Kafka consumer with automated topic subscriptions."""
+
+def init_consumer():
     conf = {
         'bootstrap.servers': KAFKA_BROKER,
-        'group.id': 'analytics_sync_workers_v3',  # Fresh consumer group to clear offsets
+        'group.id': f'analytics_pipeline_{int(time.time())}',
         'auto.offset.reset': 'earliest',
-        'enable.auto.commit': True
+        'enable.auto.commit': False,
     }
-
-    topics = [
-        'finance_db.operations.customers',
-        'finance_db.operations.products',
-        'finance_db.operations.orders',
-        'finance_db.operations.order_items'
-    ]
-
     while True:
         try:
-            consumer = Consumer(conf)
-            consumer.subscribe(topics)
-            return consumer
+            c = Consumer(conf)
+            c.subscribe(TOPICS)
+            return c
         except Exception as e:
-            print(f"Waiting for Kafka Broker ({KAFKA_BROKER}) to stabilize... Error: {e}")
+            print(f"Kafka not ready: {e}, retrying in 5s...")
             time.sleep(5)
+
+
+def get_or_create_customer(cursor, customer_id):
+    cursor.execute(
+        "SELECT customer FROM analytics.dim_customers WHERE customer_id = %s AND is_current = TRUE",
+        (customer_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    cursor.execute(
+        "SELECT customer_name, customer_address FROM operations.customers WHERE customer_id = %s",
+        (customer_id,)
+    )
+    src = cursor.fetchone()
+    if not src:
+        return None
+    cursor.execute(
+        """INSERT INTO analytics.dim_customers (customer_id, customer_name, customer_address, valid_from, is_current)
+           VALUES (%s, %s, %s, NOW(), TRUE) RETURNING customer""",
+        (customer_id, src[0], src[1])
+    )
+    return cursor.fetchone()[0]
+
+
+def get_or_create_product(cursor, product_id):
+    cursor.execute(
+        "SELECT product FROM analytics.dim_products WHERE product_id = %s AND is_current = TRUE",
+        (product_id,)
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    cursor.execute(
+        "SELECT product_name, barcode FROM operations.products WHERE product_id = %s",
+        (product_id,)
+    )
+    src = cursor.fetchone()
+    if not src:
+        return None
+    cursor.execute(
+        """INSERT INTO analytics.dim_products (product_id, product_name, barcode, valid_from, is_current)
+           VALUES (%s, %s, %s, NOW(), TRUE) RETURNING product""",
+        (product_id, src[0], src[1])
+    )
+    return cursor.fetchone()[0]
+
+
+def merge_into_fact(cursor, order_id, order_item_id):
+    """Join staging tables and upsert into the fact table whenever both sides exist."""
+    cursor.execute(
+        """SELECT o.customer_id, o.order_date, o.delivery_date, o.status,
+                  i.product_id, i.quantity
+           FROM analytics.staging_orders o
+           JOIN analytics.staging_order_items i ON i.order_id = o.order_id
+           WHERE o.order_id = %s AND i.order_item_id = %s""",
+        (order_id, order_item_id)
+    )
+    row = cursor.fetchone()
+    if not row:
+        return  # other side not yet arrived — will be triggered when it comes in
+
+    customer_id, order_date, delivery_date, status, product_id, quantity = row
+
+    customer_surrogate = get_or_create_customer(cursor, customer_id)
+    if customer_surrogate is None:
+        print(f"Customer {customer_id} not found, skipping fact merge for item {order_item_id}")
+        return
+
+    product_surrogate = get_or_create_product(cursor, product_id)
+    if product_surrogate is None:
+        print(f"Product {product_id} not found, skipping fact merge for item {order_item_id}")
+        return
+
+    cursor.execute(
+        "SELECT unity_price FROM operations.products WHERE product_id = %s",
+        (product_id,)
+    )
+    price_row = cursor.fetchone()
+    unity_price = float(price_row[0]) if price_row else 0.0
+    total_amount = float(quantity) * unity_price
+
+    cursor.execute(
+        """INSERT INTO analytics.customer_order_items
+               (order_id, order_item_id, customer, product, order_date, delivery_date,
+                status, quantity, unity_price, total_amount, updated_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+           ON CONFLICT (order_id, order_item_id) DO UPDATE
+               SET status        = EXCLUDED.status,
+                   quantity      = EXCLUDED.quantity,
+                   total_amount  = EXCLUDED.total_amount,
+                   delivery_date = EXCLUDED.delivery_date,
+                   updated_at    = NOW()""",
+        (order_id, order_item_id, customer_surrogate, product_surrogate,
+         order_date, delivery_date, status, quantity, unity_price, total_amount)
+    )
+    print(f"Fact upserted: order={order_id} item={order_item_id} status={status}")
+
+
+def handle_customer(cursor, after):
+    customer_id = after['customer_id']
+    cursor.execute(
+        "UPDATE analytics.dim_customers SET is_current = FALSE, valid_to = NOW() WHERE customer_id = %s AND is_current = TRUE",
+        (customer_id,)
+    )
+    cursor.execute(
+        """INSERT INTO analytics.dim_customers (customer_id, customer_name, customer_address, valid_from, is_current)
+           VALUES (%s, %s, %s, NOW(), TRUE)""",
+        (customer_id, after['customer_name'], after['customer_address'])
+    )
+    print(f"Customer {customer_id} upserted")
+
+
+def handle_product(cursor, after):
+    product_id = after['product_id']
+    cursor.execute(
+        "UPDATE analytics.dim_products SET is_current = FALSE, valid_to = NOW() WHERE product_id = %s AND is_current = TRUE",
+        (product_id,)
+    )
+    cursor.execute(
+        """INSERT INTO analytics.dim_products (product_id, product_name, barcode, valid_from, is_current)
+           VALUES (%s, %s, %s, NOW(), TRUE)""",
+        (product_id, after['product_name'], after['barcode'])
+    )
+    print(f"Product {product_id} upserted")
+
+
+def handle_order(cursor, after):
+    order_id = after['order_id']
+    status = after['status']
+    raw_dd = after.get('delivery_date')
+    delivery_date = epoch_days_to_yyyymmdd(raw_dd) if raw_dd else None
+    raw_od = after.get('order_date')
+    order_date = epoch_days_to_yyyymmdd(raw_od) if raw_od else int(time.strftime('%Y%m%d'))
+
+    # Upsert into staging — captures every status change
+    cursor.execute(
+        """INSERT INTO analytics.staging_orders (order_id, customer_id, order_date, delivery_date, status, updated_at)
+           VALUES (%s, %s, %s, %s, %s, NOW())
+           ON CONFLICT (order_id) DO UPDATE
+               SET status = EXCLUDED.status,
+                   delivery_date = EXCLUDED.delivery_date,
+                   updated_at = NOW()""",
+        (order_id, after['customer_id'], order_date, delivery_date, status)
+    )
+    print(f"Order {order_id} staged: status={status}")
+
+    # Update any fact rows already inserted for this order
+    cursor.execute(
+        """UPDATE analytics.customer_order_items
+           SET status = %s, delivery_date = COALESCE(%s, delivery_date), updated_at = NOW()
+           WHERE order_id = %s""",
+        (status, delivery_date, order_id)
+    )
+
+    # Merge any order_items that arrived before this order event
+    cursor.execute(
+        "SELECT order_item_id FROM analytics.staging_order_items WHERE order_id = %s",
+        (order_id,)
+    )
+    for (order_item_id,) in cursor.fetchall():
+        merge_into_fact(cursor, order_id, order_item_id)
+
+
+def handle_order_item(cursor, after):
+    order_item_id = after['order_item_id']
+    order_id = after['order_id']
+    product_id = after['product_id']
+    quantity = after['quanity']  # typo in source schema
+
+    # Upsert into staging
+    cursor.execute(
+        """INSERT INTO analytics.staging_order_items (order_item_id, order_id, product_id, quantity, updated_at)
+           VALUES (%s, %s, %s, %s, NOW())
+           ON CONFLICT (order_item_id) DO UPDATE
+               SET quantity = EXCLUDED.quantity,
+                   updated_at = NOW()""",
+        (order_item_id, order_id, product_id, quantity)
+    )
+    print(f"Order item {order_item_id} staged")
+
+    # Merge — will succeed if the orders event already arrived, otherwise waits
+    merge_into_fact(cursor, order_id, order_item_id)
+
 
 def process_stream():
     conn = get_db_connection()
     cursor = conn.cursor()
-    consumer = init_kafka_consumer()
+    consumer = init_consumer()
 
-    print("🚀 Streaming pipeline is active and listening for CDC changes...")
+    print("Streaming pipeline active, listening for CDC events...")
 
     try:
         while True:
-            # Poll for a message (1.0-second timeout)
             msg = consumer.poll(timeout=1.0)
             if msg is None:
                 continue
             if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                else:
-                    print(f"❌ Kafka error: {msg.error()}")
-                    continue
-
-            # Deserialize JSON payload safely
-            try:
-                msg_payload = json.loads(msg.value().decode('utf-8'))
-                print(msg_payload)
-                # 🚀 DEBUG LOGGER: This will explicitly tell us if data is hitting the container!
-                print(f"📥 RAW EVENT DETECTED on topic [{msg.topic()}]: {json.dumps(msg_payload)[:200]}...")
-            except Exception as parse_err:
-                print(f"Failed to parse JSON string: {parse_err}")
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    print(f"Kafka error: {msg.error()}")
                 continue
 
-            after_state = msg_payload['after']
-            if not after_state:
+            try:
+                payload = json.loads(msg.value().decode('utf-8'))
+            except Exception as e:
+                print(f"Failed to parse message: {e}")
+                continue
+
+            after = payload.get('after')
+            if not after:
                 continue
 
             topic = msg.topic()
-            print(topic)
 
             try:
-                # 1. HANDLE CUSTOMERS CHANGING (SCD TYPE 2)
                 if 'customers' in topic:
-                    customer_id = after_state['customer_id']
-                    print(f"👤 Processing Customer {customer_id} update...")
-
-                    cursor.execute(
-                        "SELECT customer FROM analytics.dim_customers WHERE customer_id = %s AND is_current = TRUE",
-                        (customer_id,)
-                    )
-                    exists = cursor.fetchone()
-
-                    if exists:
-                        cursor.execute("""
-                                       UPDATE analytics.dim_customers
-                                       SET is_current = FALSE, valid_to = NOW()
-                                       WHERE customer_id = %s AND is_current = TRUE;
-                                       """, (customer_id,))
-
-                    cursor.execute("""
-                                   INSERT INTO analytics.dim_customers (customer_id, customer_name, customer_address, valid_from, is_current)
-                                   VALUES (%s, %s, %s, NOW(), TRUE);
-                                   """, (customer_id, after_state['customer_name'], after_state['customer_address']))
-
-                # 2. HANDLE PRODUCTS CHANGING (SCD TYPE 2)
+                    handle_customer(cursor, after)
                 elif 'products' in topic:
-                    product_id = after_state['product_id']
-                    print(f"🏷️ Processing Product {product_id} update...")
-
-                    cursor.execute(
-                        "SELECT product FROM analytics.dim_products WHERE product_id = %s AND is_current = TRUE",
-                        (product_id,)
-                    )
-                    exists = cursor.fetchone()
-
-                    if exists:
-                        cursor.execute("""
-                                       UPDATE analytics.dim_products
-                                       SET is_current = FALSE, valid_to = NOW()
-                                       WHERE product_id = %s AND is_current = TRUE;
-                                       """, (product_id,))
-
-                    cursor.execute("""
-                                   INSERT INTO analytics.dim_products (product_id, product_name, barcode, valid_from, is_current)
-                                   VALUES (%s, %s, %s, NOW(), TRUE);
-                                   """, (product_id, after_state['product_name'], after_state['barcode']))
-
-                # 3. HANDLE LIVE ORDER ITEMS CHANGES (FACT UPSERT ENGINE)
+                    handle_product(cursor, after)
                 elif 'order_items' in topic:
-                    order_item_id = after_state['order_item_id']
-                    order_id = after_state['order_id']
-                    product_id = after_state['product_id']
-                    quantity = after_state['quanity']
-                    print(f"📦 Processing Order Item {order_item_id} for Order {order_id}...")
+                    handle_order_item(cursor, after)
+                elif 'orders' in topic:
+                    handle_order(cursor, after)
 
-                    cursor.execute(
-                        "SELECT customer_id, order_date, delivery_date, status FROM operations.orders WHERE order_id = %s",
-                        (order_id,)
-                    )
-                    order_header = cursor.fetchone()
-
-                    if not order_header:
-                        print(f"⚠️ Header for order {order_id} not available yet. Skipping item.")
-                        continue
-
-                    cust_id, order_date, delivery_date, status = order_header
-
-                    order_date = int(order_date.strftime(DIM_DATE_TIMESTAMP_FORMAT)) if order_date else int(time.strftime(DIM_DATE_TIMESTAMP_FORMAT))
-                    delivery_date = int(delivery_date.strftime(DIM_DATE_TIMESTAMP_FORMAT)) if delivery_date else None
-
-                    cursor.execute(
-                        "SELECT unity_price FROM operations.products WHERE product_id = %s",
-                        (product_id,)
-                    )
-                    price_row = cursor.fetchone()
-                    unity_price = price_row[0] if price_row else 0.00
-                    total_amount = float(quantity) * float(unity_price)
-
-                    cursor.execute("""
-                                   INSERT INTO analytics.customer_order_items (order_id, order_item_id, customer, product,
-                                                                               order_date, delivery_date, status, quantity,
-                                                                               unity_price, total_amount, updated_at)
-                                   VALUES (%s, %s,
-                                           COALESCE((SELECT customer FROM analytics.dim_customers WHERE customer_id = %s AND is_current = TRUE), 1),
-                                           COALESCE((SELECT product FROM analytics.dim_products WHERE product_id = %s AND is_current = TRUE), 1),
-                                           %s, %s, %s, %s, %s, %s, NOW())
-                                       ON CONFLICT (order_id, order_item_id) 
-                                       DO UPDATE SET status = EXCLUDED.status,
-                                                                                     quantity = EXCLUDED.quantity,
-                                                                                     total_amount = EXCLUDED.total_amount,
-                                                                                     delivery_date = EXCLUDED.delivery_date,
-                                                                                     updated_at = NOW();
-                                   """, (order_id, order_item_id, cust_id, product_id, order_date, delivery_date, status, quantity, unity_price, total_amount))
-
-                # Commit transaction block on processing success
                 conn.commit()
 
-            except Exception as error:
-                print(f"❌ Error encountered processing streaming packet record: {error}")
+            except Exception as e:
+                print(f"Error processing {topic}: {e}")
                 conn.rollback()
 
     except KeyboardInterrupt:
-        print("\nStopping streaming ingestion gracefully...")
+        print("Shutting down...")
     finally:
         consumer.close()
+        conn.close()
+
 
 if __name__ == "__main__":
     process_stream()
